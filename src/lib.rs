@@ -52,7 +52,7 @@ impl<'a, T: Default> Iterator for PoolIter<'a, T> {
 pub struct PoolIterMut<'a, T: Default> {
     start: *const *mut T,
     end: *const *mut T,
-    _phantom: PhantomData<&'a [T]>
+    _phantom: PhantomData<&'a mut [T]>
 }
 
 impl<'a, T: Default> Iterator for PoolIterMut<'a, T> {
@@ -75,7 +75,7 @@ impl<'a, T: Default> Iterator for PoolIterMut<'a, T> {
 pub struct Pool<T: Default> {
     _data: Vec<T>,
     ptrs: Vec<*mut T>,
-    ptrs_split: usize,
+    alive_ct: usize,
 }
 
 impl<T: Default> Pool<T> {
@@ -94,49 +94,75 @@ impl<T: Default> Pool<T> {
         Self {
             _data: data,
             ptrs,
-            ptrs_split: 0,
+            alive_ct: 0,
         }
     }
 
     /// Instantiate an object.
-    /// Will return None if `self.available() == 0`.
+    /// Will return None if `self.is_empty()`.
+    #[inline]
     pub fn spawn(&mut self) -> Option<&mut T> {
-        if self.available() == 0 {
+        if self.is_empty() {
             None
         } else {
-            let ptr = *unsafe { self.ptrs.get_unchecked(self.ptrs_split) };
-            self.ptrs_split += 1;
-            Some(unsafe { &mut *ptr })
+            Some(unsafe { self.spawn_unchecked() })
         }
     }
+
+    /// Get an &mut T from a *mut T found at `ptrs[at]`.
+    /// Unchecked.
+    /// Safe as long as `at` is within bounds of `self.ptr`.
+    #[inline]
+    unsafe fn get_ptr_as_mut_ref(&mut self, at: usize) -> &mut T {
+        // safe as long as:
+        //   at is within bounds
+        //   all ptrs in self.ptrs point to valid data
+        &mut **self.ptrs.get_unchecked(at)
+    }
+
+    /// Instantiate an object.
+    /// Undefined behavior if `self.is_empty()`.
+    pub unsafe fn spawn_unchecked(&mut self) -> &mut T {
+        let at = self.alive_ct;
+        self.alive_ct += 1;
+        self.get_ptr_as_mut_ref(at)
+    }
+
+    // TODO
+    // attach just spawns one and copies/moves a T into it
+    // detach would have to be done like reclaim?
+    // unless you do detach first or something idk
+    // guarantee order? until you reclam at least
+    // reclaim vs reclaim_unstable
+    // no guarantees about order of the dead
 
     /// Kill objects in the pool based on `kill_fn`.
     /// If `kill_fn` returns true, the object will be recycled.
     pub fn reclaim<F: Fn(&T) -> bool>(&mut self, kill_fn: F) {
-        // safe because len can never go below zero
-        //      and i can never go above self.ptrs_split
-        //      len only ever goes down, i only ever goes up
-        let mut len = self.ptrs_split;
+        // safe because:
+        //      alive_ct can never go below zero
+        //      i can never go above alive_ct
+        //      alive_ct only ever goes down, i only ever goes up
+        let mut alive_ct = self.alive_ct;
         let mut i = 0;
         loop {
-            if i >= len {
+            if i >= alive_ct {
                 break;
             }
-            let ptr = *unsafe { self.ptrs.get_unchecked(i) };
-            if kill_fn(unsafe { &mut *ptr }) {
-                len -= 1;
-                self.ptrs.swap(i, len);
+            if kill_fn(unsafe { self.get_ptr_as_mut_ref(i) }) {
+                alive_ct -= 1;
+                self.ptrs.swap(i, alive_ct);
             }
             i += 1;
         }
-        self.ptrs_split = len;
+        self.alive_ct = alive_ct;
     }
 
     /// Returns an iterator over the pool.
     pub fn iter(&self) -> PoolIter<T> {
         let start = self.ptrs.as_ptr();
         // note: safe, see rust docs for ptr.add
-        let end = unsafe { start.add(self.ptrs_split) };
+        let end = unsafe { start.add(self.alive_ct) };
         PoolIter {
             start,
             end,
@@ -148,7 +174,7 @@ impl<T: Default> Pool<T> {
     pub fn iter_mut(&mut self) -> PoolIterMut<T> {
         let start = self.ptrs.as_ptr();
         // note: safe, see rust docs for ptr.add
-        let end = unsafe { start.add(self.ptrs_split) };
+        let end = unsafe { start.add(self.alive_ct) };
         PoolIterMut {
             start,
             end,
@@ -159,14 +185,20 @@ impl<T: Default> Pool<T> {
     /// Sort pointers to free objects for better cache locality.
     pub fn sort_the_dead(&mut self) {
         if self.available() >= 2 {
-            self.ptrs[self.ptrs_split..].sort_unstable();
+            self.ptrs[self.alive_ct..].sort_unstable();
         }
+    }
+
+    /// Returns whether there are free objects in the pool or not.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.available() == 0
     }
 
     /// Number of free objects in the pool.
     #[inline]
     pub fn available(&self) -> usize {
-        self.ptrs.len() - self.ptrs_split
+        self.ptrs.len() - self.alive_ct
     }
 }
 
@@ -174,6 +206,7 @@ impl<T: Default> Pool<T> {
 pub trait Recyclable: Default {
     /// Reset the object.
     /// Defaults to `*self = Default::default()`.
+    // TODO no default here
     fn reset(&mut self) {
         *self = Default::default();
     }
@@ -186,5 +219,14 @@ impl<T: Recyclable> Pool<T> {
         let obj = self.spawn()?;
         obj.reset();
         Some(obj)
+    }
+
+    /// Spawn an object.
+    /// Object will be reset based on its implementation of Recyclable.
+    /// Undefined behavior if `self.is_empty()`.
+    pub unsafe fn spawn_new_unchecked(&mut self) -> &mut T {
+        let obj = self.spawn_unchecked();
+        obj.reset();
+        obj
     }
 }
