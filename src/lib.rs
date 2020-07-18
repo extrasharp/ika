@@ -9,12 +9,9 @@ use std::{
 // TODO write tests
 //      impl Recyclable on stdlib types
 //      make a threadsafe version
-
-pub trait Recyclable: Default {
-    fn reset(&mut self) {
-        *self = Default::default();
-    }
-}
+//      resizable
+//        breaks everything
+//      function to 'relocaize' the pool and order the pointed in dead nicely for cache locality
 
 //
 
@@ -42,12 +39,15 @@ pub trait Recyclable: Default {
 
 //
 
-pub struct PoolObject<'a, T: Recyclable> {
+/// Smart pointer to an object taken from the pool.
+///
+/// Will be returned to the pool on drop.
+pub struct PoolObject<'a, T: Default> {
     pool: &'a Pool<T>,
     obj: *mut T,
 }
 
-impl<'a, T: Recyclable> Deref for PoolObject<'a, T> {
+impl<'a, T: Default> Deref for PoolObject<'a, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -55,13 +55,13 @@ impl<'a, T: Recyclable> Deref for PoolObject<'a, T> {
     }
 }
 
-impl<'a, T: Recyclable> DerefMut for PoolObject<'a, T> {
+impl<'a, T: Default> DerefMut for PoolObject<'a, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         unsafe { &mut *self.obj }
     }
 }
 
-impl<'a, T: Recyclable> Drop for PoolObject<'a, T> {
+impl<'a, T: Default> Drop for PoolObject<'a, T> {
     fn drop(&mut self) {
         self.pool.dead.borrow_mut().push(self.obj);
     }
@@ -69,19 +69,25 @@ impl<'a, T: Recyclable> Drop for PoolObject<'a, T> {
 
 //
 
-pub struct Pool<T: Recyclable> {
+/// Let's go swimming
+pub struct Pool<T: Default> {
     _data: Vec<T>,
     dead: RefCell<Vec<*mut T>>,
 }
 
-impl<T: Recyclable> Pool<T> {
+impl<T: Default> Pool<T> {
+    /// Create a new pool with a max capacity of `size`
     pub fn new(size: usize) -> Self {
         let mut data: Vec<T> = (0..size).map(|_| Default::default())
                                         .collect();
 
         let start = data.as_mut_ptr();
         let mut dead = Vec::with_capacity(size);
-        for i in 0..size {
+        for i in 0..data.len() {
+            // this add is safe:
+            //   ptr always in bounds, just going up to data.len() - 1
+            //   vec.as_ptr().add(vec.len()) is safe
+            //   vec's dont wrap around address space
             dead.push(unsafe { start.add(i) });
         }
         Self {
@@ -90,6 +96,8 @@ impl<T: Recyclable> Pool<T> {
         }
     }
 
+    /// Take an object from the pool.
+    /// Object may have old data, but it will have at least been initialized with `Default::default`
     pub fn take<'a>(&'a self) -> Option<PoolObject<'a, T>> {
         Some(PoolObject {
             pool: self,
@@ -97,13 +105,29 @@ impl<T: Recyclable> Pool<T> {
         })
     }
 
+    /// Number of objects available to take from the pool.
+    pub fn available(&self) -> usize {
+        self.dead.borrow().len()
+    }
+}
+
+//
+
+/// A trait to simplify initializing objects taken from the pool.
+pub trait Recyclable: Default {
+    /// Reset the object.
+    /// Defaults to `*self = Default::default()`
+    fn reset(&mut self) {
+        *self = Default::default();
+    }
+}
+
+impl<T: Recyclable> Pool<T> {
+    /// Take an object from the pool.
+    /// Object will be reset based on it's implementation of Recyclable.
     pub fn take_new<'a>(&'a self) -> Option<PoolObject<'a, T>> {
         let mut obj = self.take()?;
         obj.reset();
         Some(obj)
-    }
-
-    pub fn available(&self) -> usize {
-        self.dead.borrow().len()
     }
 }

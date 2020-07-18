@@ -3,6 +3,12 @@ name = "ika"
 version = "0.1.0"
 authors = ["extrasharp <genericpb@gmail.com>"]
 edition = "2018"
+license = "MIT"
+description = "object pool"
+repository = "https://github.com/extrasharp/ika"
+
+keywords = ["pool", "recycle"]
+categories = ["memory-management", "data-structures"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
