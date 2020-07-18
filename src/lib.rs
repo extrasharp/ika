@@ -107,7 +107,7 @@ impl<T: Default> Pool<T> {
     }
 
     /// Kill objects in the pool based on `kill_fn`.
-    /// If `kill_fn` return true, the object will be recycled.
+    /// If `kill_fn` returns true, the object will be recycled.
     pub fn reclaim<F: Fn(&T) -> bool>(&mut self, kill_fn: F) {
         let len = self.alive.len();
         let mut del = 0;
