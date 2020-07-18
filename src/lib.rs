@@ -1,82 +1,83 @@
 use std::{
-    ops::{
-        Deref,
-        DerefMut,
-    },
-    cell::RefCell,
+    ptr,
+    marker::PhantomData,
 };
 
 // TODO write tests
+//      usage documentation
 //      impl Recyclable on stdlib types
 //      make a threadsafe version
-//      resizable
+//      resizable ?
 //        breaks everything
-//      function to 'relocaize' the pool and order the pointed in dead nicely for cache locality
 
-//
+// Saftey
+//   iterators are safe
+//     start and end always fit the data
+//     any &T's taken from the iter point to valid data
+//   pool is safe
+//     see comments
+//     turning the *mut into &mut in spawn and reclaim { kill_fn } is safe
+//       because its always pointing to valid data
+//       also, the pointers can only be in either dead or alive
+//         wont ever have an 2 &mut to the same location
+//       also, rust compiler is more strict than necessary,
+//         because spawn and reclaim are &mut self
 
-// PoolObject.obj is completely safe
-//   always points to data in the pool
-//   all pointers from the pool are unique
-//   PoolObject must live as long as Pool
-//   needs to be a ptr to fit PoolObject::drop
-//     the PoolObject behind '&mut self' passed into drop will die afterwards
-//     rust complains self.obj pushed into the dead objects outlives the `&mut self` borrow
-//     which it does, in fact, do but. ya know.
-// RefCell accesses are completely safe
-//   RefCell is necessary so PoolObject doesnt need an &mut to the pool
-//     otherwise you could only do one pool.take()
-//     in this case its fine to have multiple mut refs to the pool
-//       they only ever modify one thing, pool.data
-//           and only do so for one funciton call
-//         its not thread safe, but otherwise its fine
-//       any 'two &mut's to the same data' issues are solved by PoolObject being safe
-//     Pool.take() being &self is a bonus
-//       because a pool is a basically a special memory allocator
-//         even if take() does mutate the pool, its not //really// mutating it
-//   could put a RefCell<Vec<*mut T>> in the PoolObject, but thats wierd
-//     doesnt solve the problem and also youd need a PhantomData<&'a Pool<T>> anyway
-
-//
-
-/// Smart pointer to an object taken from the pool.
-///
-/// Will be returned to the pool on drop.
-pub struct PoolObject<'a, T: Default> {
-    pool: &'a Pool<T>,
-    obj: *mut T,
+/// Immutable pool iterator.
+pub struct PoolIter<'a, T: Default> {
+    start: *const *mut T,
+    end: *const *mut T,
+    _phantom: PhantomData<&'a [T]>
 }
 
-impl<'a, T: Default> Deref for PoolObject<'a, T> {
-    type Target = T;
+impl<'a, T: Default> Iterator for PoolIter<'a, T> {
+    type Item = &'a T;
 
-    fn deref(&self) -> &Self::Target {
-        unsafe { & *self.obj }
+    fn next(&mut self) -> Option<Self::Item> {
+        unsafe {
+            let ret = if ptr::eq(self.start, self.end) {
+                None
+            } else {
+                Some(& **self.start)
+            };
+            self.start = self.start.add(1);
+            ret
+        }
     }
 }
 
-impl<'a, T: Default> DerefMut for PoolObject<'a, T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        unsafe { &mut *self.obj }
+/// Mutable pool iterator.
+pub struct PoolIterMut<'a, T: Default> {
+    start: *const *mut T,
+    end: *const *mut T,
+    _phantom: PhantomData<&'a [T]>
+}
+
+impl<'a, T: Default> Iterator for PoolIterMut<'a, T> {
+    type Item = &'a mut T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        unsafe {
+            let ret = if ptr::eq(self.start, self.end) {
+                None
+            } else {
+                Some(&mut **self.start)
+            };
+            self.start = self.start.add(1);
+            ret
+        }
     }
 }
 
-impl<'a, T: Default> Drop for PoolObject<'a, T> {
-    fn drop(&mut self) {
-        self.pool.dead.borrow_mut().push(self.obj);
-    }
-}
-
-//
-
-/// Let's go swimming
+/// Let's go swimming!
 pub struct Pool<T: Default> {
     _data: Vec<T>,
-    dead: RefCell<Vec<*mut T>>,
+    dead: Vec<*mut T>,
+    alive: Vec<*mut T>,
 }
 
 impl<T: Default> Pool<T> {
-    /// Create a new pool with a max capacity of `size`
+    /// Create a new pool with a maximum capacity of `size`.
     pub fn new(size: usize) -> Self {
         let mut data: Vec<T> = (0..size).map(|_| Default::default())
                                         .collect();
@@ -84,49 +85,96 @@ impl<T: Default> Pool<T> {
         let start = data.as_mut_ptr();
         let mut dead = Vec::with_capacity(size);
         for i in 0..data.len() {
-            // this add is safe:
-            //   ptr always in bounds, just going up to data.len() - 1
-            //   vec.as_ptr().add(vec.len()) is safe
-            //   vec's dont wrap around address space
+            // note: safe, see rust docs for ptr.add
             dead.push(unsafe { start.add(i) });
         }
+
+        let alive = Vec::with_capacity(size);
+
         Self {
             _data: data,
-            dead: RefCell::new(dead),
+            dead,
+            alive,
         }
     }
 
-    /// Take an object from the pool.
-    /// Object may have old data, but it will have at least been initialized with `Default::default`
-    pub fn take<'a>(&'a self) -> Option<PoolObject<'a, T>> {
-        Some(PoolObject {
-            pool: self,
-            obj: self.dead.borrow_mut().pop()?,
-        })
+    /// Instantiate an object.
+    /// Will return None if `self.available() == 0`.
+    pub fn spawn(&mut self) -> Option<&mut T> {
+        let ptr = self.dead.pop()?;
+        self.alive.push(ptr);
+        Some(unsafe { &mut *ptr })
     }
 
-    /// Number of objects available to take from the pool.
+    /// Kill objects in the pool based on `kill_fn`.
+    /// If `kill_fn` return true, the object will be recycled.
+    pub fn reclaim<F: Fn(&T) -> bool>(&mut self, kill_fn: F) {
+        let len = self.alive.len();
+        let mut del = 0;
+        for i in 0..len {
+            // note: safe because just going up to alive.len()
+            let ptr = *unsafe { self.alive.get_unchecked(i) };
+            if kill_fn(unsafe { &mut *ptr }) {
+                self.dead.push(ptr);
+                del += 1;
+            } else if del > 0 {
+                self.alive.swap(i, i - del);
+            }
+        }
+        if del > 0 {
+            self.alive.truncate(len - del);
+        }
+    }
+
+    /// Returns an iterator over the pool.
+    pub fn iter(&self) -> PoolIter<T> {
+        let start = self.alive.as_ptr();
+        // note: safe, see rust docs for ptr.add
+        let end = unsafe { start.add(self.alive.len()) };
+        PoolIter {
+            start,
+            end,
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Returns a mutable iterator over the pool.
+    pub fn iter_mut(&mut self) -> PoolIterMut<T> {
+        let start = self.alive.as_mut_ptr();
+        // note: safe, see rust docs for ptr.add
+        let end = unsafe { start.add(self.alive.len()) };
+        PoolIterMut {
+            start,
+            end,
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Sort pointers to free objects for better cache locality.
+    pub fn sort_the_dead(&mut self) {
+        self.dead.sort_unstable();
+    }
+
+    /// Number of free objects in the pool.
     pub fn available(&self) -> usize {
-        self.dead.borrow().len()
+        self.dead.len()
     }
 }
-
-//
 
 /// A trait to simplify initializing objects taken from the pool.
 pub trait Recyclable: Default {
     /// Reset the object.
-    /// Defaults to `*self = Default::default()`
+    /// Defaults to `*self = Default::default()`.
     fn reset(&mut self) {
         *self = Default::default();
     }
 }
 
 impl<T: Recyclable> Pool<T> {
-    /// Take an object from the pool.
-    /// Object will be reset based on it's implementation of Recyclable.
-    pub fn take_new<'a>(&'a self) -> Option<PoolObject<'a, T>> {
-        let mut obj = self.take()?;
+    /// Spawn an object.
+    /// Object will be reset based on its implementation of Recyclable.
+    pub fn spawn_new(&mut self) -> Option<&mut T> {
+        let obj = self.spawn()?;
         obj.reset();
         Some(obj)
     }
