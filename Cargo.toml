@@ -1,13 +1,13 @@
 [package]
 name = "ika"
-version = "0.2.0"
-authors = ["extrasharp <genericpb@gmail.com>"]
+version = "0.3.0"
 edition = "2018"
-license = "MIT"
-description = "object pool"
-repository = "https://github.com/extrasharp/ika"
-
+description = "rusty object pool"
 keywords = ["pool", "recycle"]
 categories = ["memory-management", "data-structures"]
+authors = ["extrasharp <genericpb@gmail.com>"]
+repository = "https://github.com/extrasharp/ika"
+license = "MIT"
+readme = "README.md"
 
 [dependencies]
