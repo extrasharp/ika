@@ -19,6 +19,8 @@ use std::{
 //     guarantee order of alive objs? until you reclam at least
 //       reclaim vs reclaim_unstable
 //       no guarantees about order of the dead
+//  into_iter, common derives, clone, eq and stuff
+//  handle ZSTs
 
 // Saftey
 //   see comments
@@ -159,7 +161,7 @@ impl<T: Default> Pool<T> {
 
     /// Kill objects in the pool based on `kill_fn`.
     /// If `kill_fn` returns true, the object will be recycled.
-    pub fn reclaim<F: Fn(&T) -> bool>(&mut self, kill_fn: F) {
+    pub fn reclaim<F: FnMut(&T) -> bool>(&mut self, kill_fn: F) {
         // safe because:
         //   alive_ct can never go below zero
         //   i can never go above alive_ct
