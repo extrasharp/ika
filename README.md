@@ -1,3 +1,3 @@
 # ika  
-object pool  
+rusty object pool  
 MIT  
