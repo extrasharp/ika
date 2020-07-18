@@ -9,6 +9,7 @@ use std::{
 //      make a threadsafe version
 //      resizable ?
 //        breaks everything
+//        possible if you use handles, but that could make the iterators weird
 
 // Saftey
 //   iterators are safe
@@ -18,10 +19,11 @@ use std::{
 //     see comments
 //     turning the *mut into &mut in spawn and reclaim { kill_fn } is safe
 //       because its always pointing to valid data
-//       also, the pointers can only be in either dead or alive
-//         wont ever have an 2 &mut to the same location
+//       you can never have two &mut's to the same location
+//         ptrs in pool.ptrs are only ever swapped
 //       also, rust compiler is more strict than necessary,
 //         because spawn and reclaim are &mut self
+//           even if spawn returned a duplicate ref, rust wouldnt let you have two &mut to the pool
 
 /// Immutable pool iterator.
 pub struct PoolIter<'a, T: Default> {
@@ -34,15 +36,15 @@ impl<'a, T: Default> Iterator for PoolIter<'a, T> {
     type Item = &'a T;
 
     fn next(&mut self) -> Option<Self::Item> {
-        unsafe {
-            let ret = if ptr::eq(self.start, self.end) {
-                None
-            } else {
+        let ret = if ptr::eq(self.start, self.end) {
+            return None;
+        } else {
+            unsafe {
                 Some(& **self.start)
-            };
-            self.start = self.start.add(1);
-            ret
-        }
+            }
+        };
+        self.start = unsafe { self.start.add(1) };
+        ret
     }
 }
 
@@ -57,23 +59,23 @@ impl<'a, T: Default> Iterator for PoolIterMut<'a, T> {
     type Item = &'a mut T;
 
     fn next(&mut self) -> Option<Self::Item> {
-        unsafe {
-            let ret = if ptr::eq(self.start, self.end) {
-                None
-            } else {
+        let ret = if ptr::eq(self.start, self.end) {
+            return None;
+        } else {
+            unsafe {
                 Some(&mut **self.start)
-            };
-            self.start = self.start.add(1);
-            ret
-        }
+            }
+        };
+        self.start = unsafe { self.start.add(1) };
+        ret
     }
 }
 
 /// Let's go swimming!
 pub struct Pool<T: Default> {
     _data: Vec<T>,
-    dead: Vec<*mut T>,
-    alive: Vec<*mut T>,
+    ptrs: Vec<*mut T>,
+    ptrs_split: usize,
 }
 
 impl<T: Default> Pool<T> {
@@ -83,54 +85,58 @@ impl<T: Default> Pool<T> {
                                         .collect();
 
         let start = data.as_mut_ptr();
-        let mut dead = Vec::with_capacity(size);
+        let mut ptrs = Vec::with_capacity(size);
         for i in 0..data.len() {
             // note: safe, see rust docs for ptr.add
-            dead.push(unsafe { start.add(i) });
+            ptrs.push(unsafe { start.add(i) });
         }
-
-        let alive = Vec::with_capacity(size);
 
         Self {
             _data: data,
-            dead,
-            alive,
+            ptrs,
+            ptrs_split: 0,
         }
     }
 
     /// Instantiate an object.
     /// Will return None if `self.available() == 0`.
     pub fn spawn(&mut self) -> Option<&mut T> {
-        let ptr = self.dead.pop()?;
-        self.alive.push(ptr);
-        Some(unsafe { &mut *ptr })
+        if self.available() == 0 {
+            None
+        } else {
+            let ptr = *unsafe { self.ptrs.get_unchecked(self.ptrs_split) };
+            self.ptrs_split += 1;
+            Some(unsafe { &mut *ptr })
+        }
     }
 
     /// Kill objects in the pool based on `kill_fn`.
     /// If `kill_fn` returns true, the object will be recycled.
     pub fn reclaim<F: Fn(&T) -> bool>(&mut self, kill_fn: F) {
-        let len = self.alive.len();
-        let mut del = 0;
-        for i in 0..len {
-            // note: safe because just going up to alive.len()
-            let ptr = *unsafe { self.alive.get_unchecked(i) };
-            if kill_fn(unsafe { &mut *ptr }) {
-                self.dead.push(ptr);
-                del += 1;
-            } else if del > 0 {
-                self.alive.swap(i, i - del);
+        // safe because len can never go below zero
+        //      and i can never go above self.ptrs_split
+        //      len only ever goes down, i only ever goes up
+        let mut len = self.ptrs_split;
+        let mut i = 0;
+        loop {
+            if i >= len {
+                break;
             }
+            let ptr = *unsafe { self.ptrs.get_unchecked(i) };
+            if kill_fn(unsafe { &mut *ptr }) {
+                len -= 1;
+                self.ptrs.swap(i, len);
+            }
+            i += 1;
         }
-        if del > 0 {
-            self.alive.truncate(len - del);
-        }
+        self.ptrs_split = len;
     }
 
     /// Returns an iterator over the pool.
     pub fn iter(&self) -> PoolIter<T> {
-        let start = self.alive.as_ptr();
+        let start = self.ptrs.as_ptr();
         // note: safe, see rust docs for ptr.add
-        let end = unsafe { start.add(self.alive.len()) };
+        let end = unsafe { start.add(self.ptrs_split) };
         PoolIter {
             start,
             end,
@@ -140,9 +146,9 @@ impl<T: Default> Pool<T> {
 
     /// Returns a mutable iterator over the pool.
     pub fn iter_mut(&mut self) -> PoolIterMut<T> {
-        let start = self.alive.as_mut_ptr();
+        let start = self.ptrs.as_ptr();
         // note: safe, see rust docs for ptr.add
-        let end = unsafe { start.add(self.alive.len()) };
+        let end = unsafe { start.add(self.ptrs_split) };
         PoolIterMut {
             start,
             end,
@@ -152,12 +158,15 @@ impl<T: Default> Pool<T> {
 
     /// Sort pointers to free objects for better cache locality.
     pub fn sort_the_dead(&mut self) {
-        self.dead.sort_unstable();
+        if self.available() >= 2 {
+            self.ptrs[self.ptrs_split..].sort_unstable();
+        }
     }
 
     /// Number of free objects in the pool.
+    #[inline]
     pub fn available(&self) -> usize {
-        self.dead.len()
+        self.ptrs.len() - self.ptrs_split
     }
 }
 
