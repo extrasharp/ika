@@ -1,3 +1,25 @@
+//! # welcome to the ika pool
+//!
+//! ```rust,no_run
+//! use ika::Pool;
+//!
+//! fn main() {
+//!    let mut str_pool: Pool<String> = Pool::new(10);
+//!    str_pool.spawn_some(5)
+//!            .drain(..)
+//!            .enumerate()
+//!            .for_each(| (i, r) | {
+//!                r.push_str(&i.to_string());
+//!                r.push_str(" hallo");
+//!            });
+//!
+//!    let ok = str_pool.detach(2);
+//!
+//!    str_pool.attach(2, "wowo".to_owned());
+//! }
+//! ```
+
+
 use std::{
     slice,
     fmt,
@@ -6,9 +28,7 @@ use std::{
 // TODO
 //   write tests
 //   usage documentation
-//   make a threadsafe version
-//     think you can just wrap it in an Arc
-//  handle ZSTs
+//   handle ZSTs
 
 // Saftey
 // the main points of unsafety are:
@@ -175,7 +195,7 @@ impl<T> Pool<T> {
 
     /// Move an object out of the pool by index.
     /// Will resize the pool.  
-    /// Panics if index is out of bounds...
+    /// Panics if index is out of bounds.  
     pub fn detach(&mut self, at: usize) -> T {
         if at >= self.alive_ct {
             panic!("index out of bounds");
@@ -242,7 +262,6 @@ impl<T> Pool<T> {
 
     //
 
-    /// Returns an iterator over the pool.
     pub fn iter(&self) -> Iter<T> {
         Iter {
             data: &self.data,
@@ -250,7 +269,6 @@ impl<T> Pool<T> {
         }
     }
 
-    /// Returns an iterator over the pool.
     pub fn iter_mut(&mut self) -> IterMut<T> {
         IterMut {
             data: &mut self.data,
@@ -294,6 +312,7 @@ impl<T> Pool<T> {
 
 impl<T: Default> Pool<T> {
     /// Create a new pool with a starting size of `size`.
+    /// Objects will be initialized with `T::default()`
     pub fn new(size: usize) -> Self {
         let mut data: Vec<T> = Vec::with_capacity(size);
         for _ in 0..size {
