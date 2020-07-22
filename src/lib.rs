@@ -161,7 +161,7 @@ impl<T> Pool<T> {
 
     //
 
-    /// Move an object to the end of the pool.
+    /// Move an object into the pool.
     /// Will resize the pool.  
     pub fn attach(&mut self, at: usize, obj: T) {
         if at > self.alive_ct {
