@@ -1,8 +1,6 @@
 use std::{
     slice,
-    fmt::{
-        self,
-    },
+    fmt,
 };
 
 // TODO

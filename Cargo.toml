@@ -1,6 +1,6 @@
 [package]
 name = "ika"
-version = "0.3.2"
+version = "0.4.0"
 edition = "2018"
 description = "rusty object pool"
 keywords = ["pool", "recycle"]
