@@ -1,6 +1,5 @@
 use std::{
-    ptr,
-    marker::PhantomData,
+    slice,
 };
 
 // TODO
@@ -9,9 +8,6 @@ use std::{
 //   impl Recyclable on stdlib types
 //   make a threadsafe version
 //     think you can just wrap it in an Arc
-//   resizable ?
-//     breaks everything
-//     possible if you use handles, but that could make the iterators weird
 //   attach, detach
 //     attach just spawns one and copies/moves a T into it
 //     detach would have to be done like reclaim?
@@ -23,85 +19,52 @@ use std::{
 //  handle ZSTs
 
 // Saftey
-//   see comments
-//   BaseIter is safe
-//     start and end should always fit the data
-//     any &T's taken from the iter should point to valid data
-//   Pool is safe
-//     turning the *mut into &mut in .get_ptr_as_mut_ref is safe
-//       because its always pointing to valid data
-//       you can never have two &mut's to the same location
-//         ptrs in pool.ptrs are only ever swapped
-//       also, rust compiler is more strict than necessary,
-//         because spawn and reclaim are &mut self
-//           even if spawn returned a duplicate ref, rust wouldnt let you have two &mut to the pool
-
-struct BaseIter<'a, T: Default> {
-    start: *const *mut T,
-    end: *const *mut T,
-    _phantom: PhantomData<&'a [T]>
-}
-
-impl<'a, T: Default> BaseIter<'a, T> {
-    /// Create a new BaseIter, will iterate over `ptrs` until `ptrs[alive_ct - 1]`
-    /// `alive_ct > ptrs.len()` is undefined.
-    unsafe fn new(ptrs: &[*mut T], alive_ct: usize) -> Self {
-        let start = ptrs.as_ptr();
-        let end = start.add(alive_ct);
-        Self {
-            start,
-            end,
-            _phantom: PhantomData,
-        }
-    }
-}
-
-impl<'a, T: Default> Iterator for BaseIter<'a, T> {
-    type Item = *mut T;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if ptr::eq(self.start, self.end) {
-            None
-        } else {
-            let ret = unsafe { *self.start };
-            self.start = unsafe { self.start.add(1) };
-            Some(ret)
-        }
-    }
-}
+// the main points of unsafety are:
+//   making sure pool.offsets doesnt have two items that point to the same T in data
+//   making sure pool.offsets contains valid offsets that dont go over data.size()
+//     first solved by only ever swapping offsets
+//     both solved by initing it with 0..size
 
 /// Immutable pool iterator.
-pub struct Iter<'a, T: Default> {
-    base: BaseIter<'a, T>,
+pub struct Iter<'a, T> {
+    data: &'a Vec<T>,
+    iter: slice::Iter<'a, usize>,
 }
 
-impl<'a, T: Default> Iterator for Iter<'a, T> {
+impl<'a, T> Iterator for Iter<'a, T> {
     type Item = &'a T;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let ptr = self.base.next()?;
-        Some(unsafe { & *ptr })
+        let offset = self.iter.next()?;
+        unsafe {
+            Some(self.data.get_unchecked(*offset))
+        }
     }
 }
 
 /// Mutable pool iterator.
-pub struct IterMut<'a, T: Default> {
-    base: BaseIter<'a, T>,
+pub struct IterMut<'a, T> {
+    data: &'a mut Vec<T>,
+    iter: slice::Iter<'a, usize>,
 }
 
-impl<'a, T: Default> Iterator for IterMut<'a, T> {
+impl<'a, T> Iterator for IterMut<'a, T> {
     type Item = &'a mut T;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let ptr = self.base.next()?;
-        Some(unsafe { &mut *ptr })
+        use std::mem;
+
+        let offset = self.iter.next()?;
+        unsafe {
+            Some(mem::transmute(self.data.get_unchecked_mut(*offset)))
+        }
     }
 }
 
 /// Let's go swimming!
 pub struct Pool<T: Default> {
-    _data: Vec<T>,
-    ptrs: Vec<*mut T>,
+    data: Vec<T>,
+    offsets: Vec<usize>,
     alive_ct: usize,
 }
 
@@ -113,16 +76,14 @@ impl<T: Default> Pool<T> {
             data.push(T::default());
         }
 
-        let start = data.as_mut_ptr();
-        let mut ptrs = Vec::with_capacity(size);
+        let mut offsets = Vec::with_capacity(size);
         for i in 0..size {
-            // note: safe, see rust docs for ptr.add
-            ptrs.push(unsafe { start.add(i) });
+            offsets.push(i);
         }
 
         Self {
-            _data: data,
-            ptrs,
+            data,
+            offsets,
             alive_ct: 0,
         }
     }
@@ -139,15 +100,24 @@ impl<T: Default> Pool<T> {
         }
     }
 
-    /// Get an &mut T from a *mut T found at `ptrs[at]`.
-    /// Unchecked.
-    /// Safe as long as `at` is within bounds of `self.ptr`.
+    /// Please instantiate an object.
+    /// May allocate and resize the pool.
+    /// Object may have weird data, but it will have at least been initialized with `T::default()`.
     #[inline]
-    unsafe fn get_ptr_as_mut_ref(&mut self, at: usize) -> &mut T {
-        // safe as long as:
-        //   at is within bounds
-        //   all ptrs in self.ptrs point to valid data
-        &mut **self.ptrs.get_unchecked(at)
+    pub fn please_spawn(&mut self) -> &mut T {
+        if self.is_empty() {
+            self.offsets.push(self.data.len());
+            self.data.push(T::default());
+        }
+        unsafe { self.spawn_unchecked() }
+    }
+
+    /// Get an &mut T from the offset found at `offsets[at]`.
+    /// Unchecked.
+    /// Safe as long as `at` is within bounds of `self.offsets`.
+    #[inline]
+    unsafe fn get_at_offset(&mut self, at: usize) -> &mut T {
+        self.data.get_unchecked_mut(self.offsets[at])
     }
 
     /// Instantiate an object.
@@ -156,12 +126,12 @@ impl<T: Default> Pool<T> {
     pub unsafe fn spawn_unchecked(&mut self) -> &mut T {
         let at = self.alive_ct;
         self.alive_ct += 1;
-        self.get_ptr_as_mut_ref(at)
+        self.get_at_offset(at)
     }
 
     /// Kill objects in the pool based on `kill_fn`.
     /// If `kill_fn` returns true, the object will be recycled.
-    pub fn reclaim<F: FnMut(&T) -> bool>(&mut self, kill_fn: F) {
+    pub fn reclaim<F: FnMut(&T) -> bool>(&mut self, mut kill_fn: F) {
         // safe because:
         //   alive_ct can never go below zero
         //   i can never go above alive_ct
@@ -172,9 +142,9 @@ impl<T: Default> Pool<T> {
             if i >= alive_ct {
                 break;
             }
-            if kill_fn(unsafe { self.get_ptr_as_mut_ref(i) }) {
+            if kill_fn(unsafe { self.get_at_offset(i) }) {
                 alive_ct -= 1;
-                self.ptrs.swap(i, alive_ct);
+                self.offsets.swap(i, alive_ct);
             }
             i += 1;
         }
@@ -183,24 +153,24 @@ impl<T: Default> Pool<T> {
 
     /// Returns an iterator over the pool.
     pub fn iter(&self) -> Iter<T> {
-        let base = unsafe { BaseIter::new(&self.ptrs, self.alive_ct) };
         Iter {
-            base,
+            data: &self.data,
+            iter: (&self.offsets[..self.alive_ct]).iter(),
         }
     }
 
-    /// Returns a mutable iterator over the pool.
+    /// Returns an iterator over the pool.
     pub fn iter_mut(&mut self) -> IterMut<T> {
-        let base = unsafe { BaseIter::new(&self.ptrs, self.alive_ct) };
         IterMut {
-            base,
+            data: &mut self.data,
+            iter: (&self.offsets[..self.alive_ct]).iter(),
         }
     }
 
     /// Sort pointers to available objects for better cache locality.
     pub fn sort_the_dead(&mut self) {
         if self.available() >= 2 {
-            self.ptrs[self.alive_ct..].sort_unstable();
+            self.offsets[self.alive_ct..].sort_unstable();
         }
     }
 
@@ -213,7 +183,7 @@ impl<T: Default> Pool<T> {
     /// Number of free objects in the pool.
     #[inline]
     pub fn available(&self) -> usize {
-        self.ptrs.len() - self.alive_ct
+        self.offsets.len() - self.alive_ct
     }
 }
 
